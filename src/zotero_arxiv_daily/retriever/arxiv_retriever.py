@@ -160,9 +160,7 @@ class ArxivRetriever(BaseRetriever):
             paper_id = paper.get_short_id() if hasattr(paper, "get_short_id") else paper.entry_id
             deduped[paper_id] = paper
 
-raw_papers = list(deduped.values())
-
-        return raw_papers
+        return raw_papers = list(deduped.values())
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
         title = raw_paper.title
