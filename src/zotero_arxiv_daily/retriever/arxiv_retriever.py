@@ -32,7 +32,7 @@ def _download_file(url: str, path: str) -> None:
 
 def _run_in_subprocess(
     result_queue: Any,
-    func: Cable[..., T | None],
+    func: Callable[..., T | None],
     args: tuple[Any, ...],
 ) -> None:
     try:
@@ -42,14 +42,14 @@ def _run_in_subprocess(
 
 
 def _run_with_hard_timeout(
-    func: Cable[..., T | None],
+    func: Callable[..., T | None],
     args: tuple[Any, ...],
     *,
     timeout: float,
     operation: str,
     paper_title: str,
 ) -> T | None:
-    start_methods = multiprocessing.get__start_methods()
+    start_methods = multiprocessing.get_all_start_methods()
     context = multiprocessing.get_context("fork" if "fork" in start_methods else start_methods[0])
     result_queue = context.Queue()
     process = context.Process(target=_run_in_subprocess, args=(result_queue, func, args))
