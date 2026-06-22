@@ -32,7 +32,7 @@ def _download_file(url: str, path: str) -> None:
 
 def _run_in_subprocess(
     result_queue: Any,
-    func: Callable[..., T | None],
+    func: Cable[..., T | None],
     args: tuple[Any, ...],
 ) -> None:
     try:
@@ -42,14 +42,14 @@ def _run_in_subprocess(
 
 
 def _run_with_hard_timeout(
-    func: Callable[..., T | None],
+    func: Cable[..., T | None],
     args: tuple[Any, ...],
     *,
     timeout: float,
     operation: str,
     paper_title: str,
 ) -> T | None:
-    start_methods = multiprocessing.get_all_start_methods()
+    start_methods = multiprocessing.get__start_methods()
     context = multiprocessing.get_context("fork" if "fork" in start_methods else start_methods[0])
     result_queue = context.Queue()
     process = context.Process(target=_run_in_subprocess, args=(result_queue, func, args))
@@ -101,9 +101,9 @@ def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: s
         path = os.path.join(temp_dir, "paper.tar.gz")
         _download_file(source_url, path)
         file_contents = extract_tex_code_from_tar(path, paper_id, paper_title=paper_title)
-        if not file_contents or "all" not in file_contents:
+        if not file_contents or "" not in file_contents:
             raise ValueError("Main tex file not found.")
-        return file_contents["all"]
+        return file_contents[""]
 
 
 @register_retriever("arxiv")
@@ -128,6 +128,8 @@ class ArxivRetriever(BaseRetriever):
             for i in feed.entries
             if i.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
+        # 去重，同时保持原顺序
+        all_paper_ids = list(dict.fromkeys(all_paper_ids))
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
 
@@ -153,6 +155,12 @@ class ArxivRetriever(BaseRetriever):
             if i + 20 < len(all_paper_ids):
                 sleep(5 + random.uniform(0,3))  # 每批之间休息更久，增加随机抖动
         bar.close()
+        deduped = {}
+        for paper in raw_papers:
+            paper_id = paper.get_short_id() if hasattr(paper, "get_short_id") else paper.entry_id
+            deduped[paper_id] = paper
+
+raw_papers = list(deduped.values())
 
         return raw_papers
 
