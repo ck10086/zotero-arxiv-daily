@@ -14,6 +14,8 @@ from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
 import random
+
+
 T = TypeVar("T")
 
 DOWNLOAD_TIMEOUT = (10, 60)
@@ -90,19 +92,27 @@ def _extract_text_from_html_worker(html_url: str) -> str | None:
     downloaded = trafilatura.fetch_url(html_url)
     if downloaded is None:
         raise ValueError(f"Failed to download HTML from {html_url}")
+
     text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
     if not text:
         raise ValueError(f"No text extracted from {html_url}")
+
     return text
 
 
-def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: str | None = None) -> str | None:
+def _extract_text_from_tar_worker(
+    source_url: str,
+    paper_id: str,
+    paper_title: str | None = None,
+) -> str | None:
     with TemporaryDirectory() as temp_dir:
         path = os.path.join(temp_dir, "paper.tar.gz")
         _download_file(source_url, path)
         file_contents = extract_tex_code_from_tar(path, paper_id, paper_title=paper_title)
+
         if not file_contents or "" not in file_contents:
             raise ValueError("Main tex file not found.")
+
         return file_contents[""]
 
 
@@ -115,65 +125,92 @@ class ArxivRetriever(BaseRetriever):
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
         client = arxiv.Client(num_retries=10, delay_seconds=10)
-        query = '+'.join(self.config.source.arxiv.category)
+        query = "+".join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        # Get the latest paper from arxiv rss feed
+
+        # Get the latest paper ids from arXiv RSS feed.
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
-        if 'Feed error for query' in feed.feed.title:
+        if "Feed error for query" in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
-        raw_papers = []
+
+        raw_papers: list[ArxivResult] = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
+
         all_paper_ids = [
-            i.id.removeprefix("oai:arXiv.org:")
-            for i in feed.entries
-            if i.get("arxiv_announce_type", "new") in allowed_announce_types
+            entry.id.removeprefix("oai:arXiv.org:")
+            for entry in feed.entries
+            if entry.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
-        # 去重，同时保持原顺序
+
+        # Deduplicate RSS paper ids while preserving the original order.
         all_paper_ids = list(dict.fromkeys(all_paper_ids))
+
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
 
-        # Get full information of each paper from arxiv api
+        # Get full information of each paper from arXiv API.
         bar = tqdm(total=len(all_paper_ids))
-        max_batch_retries = 5
-        batch_retry_delay = 30
-        for i in range(0, len(all_paper_ids), 10):     # batch 从 20 -> 10
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
+
+        batch_size = 5
+        max_batch_retries = 6
+        batch_retry_delay = 60
+
+        for i in range(0, len(all_paper_ids), batch_size):
+            batch_ids = all_paper_ids[i:i + batch_size]
+
+            search = arxiv.Search(
+                id_list=batch_ids,
+                max_results=len(batch_ids),
+            )
+
             for attempt in range(max_batch_retries):
                 try:
                     batch = list(client.results(search))
-                    bar.update(len(batch))
                     raw_papers.extend(batch)
+                    bar.update(len(batch_ids))
                     break
+
                 except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
-                        wait = batch_retry_delay * (attempt + 1)+ random.uniform(0, 5)  # 随机延迟 0~5 秒
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
+                    if exc.status in {429, 503} and attempt < max_batch_retries - 1:
+                        wait = batch_retry_delay * (attempt + 1) + random.uniform(10, 30)
+                        logger.warning(
+                            f"arXiv API {exc.status} on batch {i // batch_size}, "
+                            f"retry {attempt + 1}/{max_batch_retries} in {wait:.1f}s"
+                        )
                         sleep(wait)
                     else:
-                        raise
-            if i + 20 < len(all_paper_ids):
-                sleep(5 + random.uniform(0,3))  # 每批之间休息更久，增加随机抖动
+                        logger.warning(
+                            f"Skip arXiv batch {i // batch_size} after repeated HTTP "
+                            f"{exc.status}: {batch_ids}"
+                        )
+                        bar.update(len(batch_ids))
+                        break
+
+            if i + batch_size < len(all_paper_ids):
+                sleep(20 + random.uniform(5, 15))
+
         bar.close()
-        deduped = {}
+
+        # Final deduplication to avoid duplicate papers in the email.
+        deduped: dict[str, ArxivResult] = {}
         for paper in raw_papers:
             paper_id = paper.get_short_id() if hasattr(paper, "get_short_id") else paper.entry_id
             deduped[paper_id] = paper
-            
-        raw_papers = list(deduped.values())
 
-        return raw_papers
+        return list(deduped.values())
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
         title = raw_paper.title
-        authors = [a.name for a in raw_paper.authors]
+        authors = [author.name for author in raw_paper.authors]
         abstract = raw_paper.summary
         pdf_url = raw_paper.pdf_url
+
         full_text = extract_text_from_tar(raw_paper)
         if full_text is None:
             full_text = extract_text_from_html(raw_paper)
         if full_text is None:
             full_text = extract_text_from_pdf(raw_paper)
+
         return Paper(
             source=self.name,
             title=title,
@@ -198,6 +235,7 @@ def extract_text_from_pdf(paper: ArxivResult) -> str | None:
     if paper.pdf_url is None:
         logger.warning(f"No PDF URL available for {paper.title}")
         return None
+
     return _run_with_hard_timeout(
         _extract_text_from_pdf_worker,
         (paper.pdf_url,),
@@ -212,6 +250,7 @@ def extract_text_from_tar(paper: ArxivResult) -> str | None:
     if source_url is None:
         logger.warning(f"No source URL available for {paper.title}")
         return None
+
     return _run_with_hard_timeout(
         _extract_text_from_tar_worker,
         (source_url, paper.entry_id, paper.title),
