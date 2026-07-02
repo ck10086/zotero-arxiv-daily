@@ -124,7 +124,10 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
+        # 关闭 arxiv.Client 自带重试，避免它内部连续请求导致 GitHub Actions 更容易触发 429。
+        # 429 / 503 由下面的外层逻辑统一处理。
+        client = arxiv.Client(num_retries=0, delay_seconds=0)
+
         query = "+".join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
 
@@ -142,7 +145,7 @@ class ArxivRetriever(BaseRetriever):
             if entry.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
 
-        # Deduplicate RSS paper ids while preserving the original order.
+        # RSS 侧去重，保持原始顺序，避免同一篇文章重复进入后续流程。
         all_paper_ids = list(dict.fromkeys(all_paper_ids))
 
         if self.config.executor.debug:
@@ -163,11 +166,14 @@ class ArxivRetriever(BaseRetriever):
                 max_results=len(batch_ids),
             )
 
+            batch_succeeded = False
+
             for attempt in range(max_batch_retries):
                 try:
                     batch = list(client.results(search))
                     raw_papers.extend(batch)
                     bar.update(len(batch_ids))
+                    batch_succeeded = True
                     break
 
                 except arxiv.HTTPError as exc:
@@ -183,15 +189,25 @@ class ArxivRetriever(BaseRetriever):
                             f"Skip arXiv batch {i // batch_size} after repeated HTTP "
                             f"{exc.status}: {batch_ids}"
                         )
-                        bar.update(len(batch_ids))
                         break
 
+                except Exception as exc:
+                    logger.warning(
+                        f"Skip arXiv batch {i // batch_size} because of unexpected error: "
+                        f"{type(exc).__name__}: {exc}; batch_ids={batch_ids}"
+                    )
+                    break
+
+            if not batch_succeeded:
+                bar.update(len(batch_ids))
+
+            # GitHub Actions 的共享 IP 容易被 arXiv 限流，所以每批之间主动等待。
             if i + batch_size < len(all_paper_ids):
                 sleep(20 + random.uniform(5, 15))
 
         bar.close()
 
-        # Final deduplication to avoid duplicate papers in the email.
+        # API 返回侧再去重，避免邮件中重复出现同一篇文章。
         deduped: dict[str, ArxivResult] = {}
         for paper in raw_papers:
             paper_id = paper.get_short_id() if hasattr(paper, "get_short_id") else paper.entry_id
